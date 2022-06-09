@@ -1,0 +1,351 @@
+#!/usr/bin/env python
+
+# run cutadapt
+
+import subprocess
+import sys
+import os 
+from Bio.Seq import reverse_complement
+import argparse
+from datetime import datetime
+import multiqc 
+# import functions if needed
+
+
+# functions stand alone
+def parse_metadata(metadata_file_name):
+    meta_dict = {}
+    metafile = open(metadata_file_name)
+    for line in metafile:
+        line = line.strip('\n')
+        if line.startswith('sample-id'):
+            fieldlist = line.split('\t')
+        else:
+            parts = line.split('\t')
+            sample = parts[0]
+            for i in range(0,len(parts)):
+                field = fieldlist[i]
+                datum = parts[i]
+                if field == 'rev_barcode':
+                    rc_seq = reverse_complement(datum)
+                    meta_dict.setdefault(sample, {})[field]=rc_seq
+                elif field == 'reverse_primer':
+                    revcomp = reverse_complement(datum)
+                    meta_dict.setdefault(sample, {})[field]=revcomp
+                else:
+                    meta_dict.setdefault(sample, {})[field]=(datum)
+    
+    metafile.close()
+    return meta_dict
+
+
+def make_fwd_barcodes_fa(metadata_file, data_folder):
+    # parse metadata
+    #metadata_file = parameter_dict['project_directory']+'docs/'+parameter_dict['metadata_file']
+    metadata_dict = parse_metadata(metadata_file) 
+    # make forward file
+    faout = open(data_folder+'/fwd_barcodes.fasta','w')
+    barcode_list = []
+    for k,v in metadata_dict.items():
+        # k is sample name, v is dict options
+        fwd_target = v['fwd_barcode']+v['forward_primer']
+        barcode_list.append(fwd_target)
+    barcode_set = set(barcode_list)
+    for bc in barcode_set:
+        faout.write('>'+bc+'\n'+bc+'\n')
+    faout.close()
+    return len(barcode_set)
+
+def make_rev_barcodes_fa(metadata_file, data_folder):
+    # parse metadata
+    #metadata_file = parameter_dict['project_directory']+'docs/'+parameter_dict['metadata_file']
+    metadata_dict = parse_metadata(metadata_file) 
+    # dict of dicts? {fwd_bc-primer:{sample:rev_bc-primer}}
+    barcode_dict = {}
+    for k,v in metadata_dict.items():
+        fwd_target = v['fwd_barcode']+v['forward_primer']
+        rev_target = v['reverse_primer']+v['rev_barcode']
+        barcode_dict.setdefault(fwd_target,{})[k]=rev_target
+    # unpack the dict, creating a file for each key
+    for key,value in barcode_dict.items():
+        bc_file = open(data_folder+'/rev_'+key+'.fasta','w')
+        for ky,vl in value.items():
+            bc_file.write('>'+ky+'\n'+vl+'\n')
+        bc_file.close()
+    return list(barcode_dict.keys())
+
+def cutadapt_se_dual_fwd_dm(raw_datafile,data_dir,fwd_barcode_fasta,cpu=4):
+    #proj_dir = param_dict['project_directory']
+    #trim_dir = proj_dir+'data/trimmed/'
+    #data_dir = proj_dir+'data/'
+    cpu = str(cpu)
+    raw=raw_datafile #param_dict['raw_se']
+    adapter='file:'+fwd_barcode_fasta
+    output = '"'+data_dir+'/fwd_{name}.fastq"'
+    cmdlist=['cutadapt','-j',cpu,'-g',adapter,'--trimmed-only','--error-rate','0','--no-indels','--report','minimal', '-o',output,raw]
+    cmd=' '.join(cmdlist)
+    subprocess.run(cmd, shell=True)
+    output = output.replace('"','')
+    return output
+
+def cutadapt_se_dual_rev_dm(data_dir,fwd_dm_fq,list_rev_bc,cpu=4):
+    #proj_dir = param_dict['project_directory']
+    trim_dir = data_dir+'/trimmed/'
+    #data_dir = data_dir+'data/'
+    cpu = str(cpu)
+    if os.path.isdir(trim_dir) == False:
+        subprocess.run(['mkdir',trim_dir])
+    for bc in list_rev_bc:
+        source = data_dir+'/fwd_'+bc+'.fastq'
+        output = '"'+trim_dir+'/{name}_trim.fastq"'
+        bcfile = 'file:'+data_dir+'/rev_'+bc+'.fasta'
+        cmdlist=['cutadapt', '-j', cpu, '-e', '0', '--trimmed-only','--no-indels','-a',bcfile,'-o',output,source]
+        cmd=' '.join(cmdlist)
+        subprocess.run(cmd, shell=True)
+
+def run_vsearch_qc(metadata_file,data_dir,qc_minlen,qc_maxlen,cpu=4,maxns='0',max_error='1.0',samples='all'):
+    """only two args required"""
+    #metadata_file = param_dict['project_directory']+'docs/'+param_dict['metadata_file']
+    metadata_dict = parse_metadata(metadata_file) # change from obi_meta
+    #proj_dir = param_dict['project_directory']
+    fastq_dir = data_dir+'/fastq/'
+    if os.path.isdir(fastq_dir) == False:
+        subprocess.run(['mkdir',fastq_dir])
+    fasta_dir = data_dir+'/fasta/'
+    if os.path.isdir(fasta_dir) == False:
+        subprocess.run(['mkdir',fasta_dir])
+    if samples=='all':
+        samplelist = list(metadata_dict.keys())
+    else:
+        samplelist = samples
+    vsearch_list = []
+    sampledict = {}
+    cpu = str(cpu)
+    # add fastaout option for some otu processes
+    for sample in samplelist:
+        #vList = ['bash',vscript]
+        input_file = data_dir+'/trimmed/'+sample+'_trim.fastq'
+        output_file = fastq_dir+sample+'_filt.fastq'
+        output_file = output_file.replace('//','/')
+        full_fq = os.path.abspath(output_file)
+        sampledict.setdefault(sample, {})['fq']=full_fq
+        output_fasta = fasta_dir+sample+'.fasta'
+        output_fasta = output_fasta.replace('//','/')
+        full_fa = os.path.abspath(output_fasta)
+        sampledict.setdefault(sample, {})['fa']=full_fa
+        relab = sample+'.'
+        # add relabel to fastas for when combining, to get proper tables 
+        vList = ['vsearch','-fastq_filter',input_file,'-fastq_maxee',max_error,'-fastq_minlen',qc_minlen,'--fastq_maxlen',qc_maxlen,'-fastq_maxns',maxns,'--relabel',relab,'-fastqout',output_file,'-fastaout', output_fasta]
+        vcmd=' '.join(vList)
+
+        subprocess.run(vcmd, shell=True)
+        vsearch_list.append(vcmd)
+    return sampledict
+
+def remove_demultiplex_files(data_folder):
+    rev_cmd = ['rm',data_folder+'/rev_*']
+    revcmd = ' '.join(rev_cmd)
+    subprocess.run(revcmd, shell=True)
+    fwd_cmd = ['rm',data_folder+'/fwd_*']
+    fwdcmd = ' '.join(fwd_cmd)
+    subprocess.run(fwdcmd, shell=True)
+
+def create_manifest(manifest_name,project_dir,sample_dict,seq_type,project_name):
+    output_file = project_dir+'/'+manifest_name
+    manout = open(output_file,'w')
+    if seq_type == 'se':
+        manout.write('sample-id\tabsolute-filepath\tfasta-filepath\n')
+    else:
+        manout.write('sample-id\tforward-absolute-filepath\treverse-absolute-filepath\tfasta-filepath\n')
+    for k,v in sample_dict.items():
+        manout.write(k+'\t')
+        if seq_type == 'se':
+            manout.write(v['fq']+'\t'+v['fa']+'\n')
+        else:
+            # find out later if a merged fq is needed
+            manout.write(v['fwd_fq']+'\t'+v['rev_fq']+'\t'+v['fa']+'\n')
+
+    manout.close()
+
+def count_seqs_fa(filelist):
+    count_dict = {}
+    for fa in filelist:
+        fastafile = open(fa, 'r')
+        fasta = fastafile.read()
+        numseqs = fasta.count('>')
+        count_dict[fa]=numseqs
+    
+    return count_dict
+
+def update_metadata(metadata_file,sample_dict,field_name):
+    meta_file = open(metadata_file)
+    string_list = meta_file.readlines()
+    #lines = string_list.split('\n')
+    new_list = []
+    #new_line = new_field+'\t'+component+'\t'+parameter+'\n'
+    for line in string_list:
+        line = line.strip('\n')
+        parts = line.split('\t')
+        sample = parts[0]
+        if sample == 'sample-id':
+            parts.append(field_name)
+
+        else:
+            if sample in sample_dict:
+                parts.append(str(sample_dict[sample]))
+
+            else:
+                # the sample has no field
+                parts.append('NA')
+        newline = '\t'.join(parts)
+        newline = newline+'\n'
+        new_list.append(newline)
+
+    new_contents = ''.join(new_list)
+    new_file = open(metadata_file, 'w')
+    new_file.write(new_contents)
+    new_file.close()
+
+def run_fastqc(data_dir,samplelist):
+
+    #proj_dir = param_dict['project_directory']
+    # make the output directory, if it does not exist
+    fastqc_dir = data_dir+'/fastq_qc/'
+    if os.path.isdir(fastqc_dir) == False:
+        subprocess.run(['mkdir','-p',fastqc_dir])
+    # make a command list
+    fqc_list = ['fastqc','-t','4']
+    fqc_list = fqc_list + samplelist 
+    fqc_list.append('-o')
+    fqc_list.append(fastqc_dir)
+    subprocess.run(fqc_list)
+    return fastqc_dir
+
+def create_multiqc_name_table(data_dir, fq_dict,seq_type='se'):
+    output_file = data_dir+'/multiqc_names'
+    output = open(output_file, 'w')
+    for k,v in fq_dict.items():
+        if seq_type == 'se':
+            full_fastq = v['fq'].split('/')[-1] # take out path, just file name
+            fastq = full_fastq.replace('.fastq','').replace('.gz','')
+            output.write(fastq+'\t'+k+'\n')
+        else:
+            print('need to add PE functionality here')
+            # will add later
+    output.close()
+    return output_file
+
+def run_multiqc(fastqc_dir, output_dir, project_title,sample_table='default'):
+    if sample_table == 'default':
+
+        multiqc.run(fastqc_dir, title=project_title,outdir=output_dir)
+    else:
+        multiqc.run(fastqc_dir, title=project_title,outdir=output_dir, replace_names=sample_table)
+    
+
+##########################
+def main():
+
+    prog = "cutadaptQC"
+
+    description = "Run cutadapt to demultiplex and quality control raw sequence data"
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        prog=prog,
+        description=description)
+
+    group = parser.add_argument_group("arguments")
+
+    group.add_argument('-m', '--metadata_file', dest='metadatafile', 
+            type=str, 
+            help='sample metadata file')
+    group.add_argument('-r', '--raw_fastq', dest='fastq',
+            type=str,
+            help='Raw data file to be processed')
+    group.add_argument('-f', '--data_folder', dest='datafolder',
+            type=str,
+            help='Folder to process sequence data')
+
+    group.add_argument('-l', '--min_length',default='150', dest='min_length',
+            type=str,
+            help='[OPTIONAL] minimum length for reads (default:150)')
+    group.add_argument('-x', '--max_length',default='300', dest='max_length',
+            type=str,
+            help='[OPTIONAL] maximum length for reads (default:300)')
+    group.add_argument('-a', '--max_n',default='0', dest='maxn',
+            type=str,
+            help='[OPTIONAL] maximum number of Ns in sequence (default:0)')
+    group.add_argument('-e', '--error',default='1.0', dest='error',
+            type=str,
+            help='[OPTIONAL] maximum expected error value (default:1.0)')
+    group.add_argument('-n', '--name',default='fish', dest='projectname',
+            type=str,
+            help='[OPTIONAL] Name of project (default:"fish")')
+
+    group.add_argument('-t', '--threads', dest='threads',
+            type=str,
+            help='[OPTIONAL] number of CPUs to use (default:1)')
+    
+    args = parser.parse_args()
+
+    # run the command
+    seq_min_len = str(args.min_length)
+    # test make barcodes functions
+    num_fwd_bc = make_fwd_barcodes_fa(args.metadatafile, args.datafolder)
+    rev_bc_list = make_rev_barcodes_fa(args.metadatafile, args.datafolder)
+
+    # forward demultiplexing
+    #cutadapt_se_dual_fwd_dm(raw_datafile,data_dir,fwd_barcode_fasta,cpu=4)
+    fwd_dm_file = cutadapt_se_dual_fwd_dm(args.fastq,args.datafolder,args.datafolder+'/fwd_barcodes.fasta',args.threads)
+
+    cutadapt_se_dual_rev_dm(args.datafolder,fwd_dm_file,rev_bc_list,args.threads)
+
+    #vsearch_cmd_files = run_vsearch_qc(args.metadatafile,args.datafolder,args.min_length,args.max_length,args.threads)
+    vsearch_cmd_files = run_vsearch_qc(args.metadatafile,args.datafolder,args.min_length,args.max_length,args.threads,args.maxn,args.error)
+
+    # clean up intermediate files
+    remove_demultiplex_files(args.datafolder)
+
+    manifest_name = args.projectname+'_data_manifest.tsv'
+
+    create_manifest(manifest_name,args.datafolder,vsearch_cmd_files,'se',args.projectname)
+
+    # get sequence counts
+    fasta_list = []
+    fastq_list = []
+    for k,v in vsearch_cmd_files.items():
+        fasta_list.append(v['fa'])
+        fastq_list.append(v['fq'])
+        
+    seq_ct_dict = count_seqs_fa(fasta_list)
+    print(seq_ct_dict)
+    sample_counts = {}
+    for key,value in vsearch_cmd_files.items():
+        count = seq_ct_dict[value['fa']]
+        sample_counts[key]=count
+
+    #metadata_file = project_parameters['metadata_file']
+    update_metadata(args.metadatafile,sample_counts,'read_counts')
+    # do fastqc and then multiqc
+
+    fastqc_directory = run_fastqc(args.datafolder,fastq_list)
+
+    # make table of sample names for option (later)
+    mqc_names = create_multiqc_name_table(args.datafolder, vsearch_cmd_files)
+    # for now, just run multiqc
+    #mqc_outdir = project_parameters['project_directory']+'data'
+
+    run_multiqc(fastqc_directory, args.datafolder, args.projectname,mqc_names)
+    # print out summaries
+    print('\nmanifest file created:', manifest_name,'\n')
+    print('read counts:\n')
+    
+    for ky,vl in sample_counts.items():
+        print('sample', ky,'count', vl)
+
+    print('number of fastq/fasta files created:', len(vsearch_cmd_files))
+
+
+if __name__ == "__main__":
+    main()
