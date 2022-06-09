@@ -69,3 +69,12 @@ vsearch --usearch_global field_10k_def_combined_3071650.fasta --db field_10k_def
 
 ## Assigning taxonomy to OTUs
 
+VSEARCH was used to assign a taxonomy to each OTU, using the Sintax algorithm, with a minimum cutoff of 80%. As above, the field samples is used as an example.
+
+```
+vsearch --sintax field_10k_def_vsearch_run_3071653_otu.fasta --db fish_16S_insilico_merged_tax_derep_clean_inhouse_barcodes_sintax.fasta --sintax_cutoff 0.8 --tabbedout field_10k_def_vsearch_run_3071653_Sintax_0241328raw.tsv
+```
+
+Custom Python code was then used to convert the Sintax output to a simpler format:
+
+*field_10k_def_vsearch_run_3071653_Sintax_0241328.tsv*
